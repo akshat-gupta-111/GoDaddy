@@ -1,3 +1,26 @@
+# Local notes
 CLAUDE.md
+
+# macOS
 .DS_Store
 
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Secrets and local data
+.env
+.env.*
+instance/
+*.db
+*.sqlite3
+
+# Logs and editors
+*.log
+.vscode/
+.idea/
+
+# Safe template, no real values
+!.env.example
