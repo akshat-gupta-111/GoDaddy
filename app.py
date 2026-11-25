@@ -1,14 +1,21 @@
-import importlib.util
 import os
 import secrets
 from pathlib import Path
 
-from flask import Flask, g, jsonify, request
+from flask import Flask, g, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 
 import api
+import chatbot
 import db  # api imports image_storage, which loads .env
 from services import ApiError
+
+FRONTEND = Path(__file__).resolve().parent / "frontend"
+# Only our own scripts and styles; photos come from Cloudinary.
+CONTENT_POLICY = (
+    "default-src 'self'; img-src 'self' data: blob: https://res.cloudinary.com; "
+    "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+)
 
 
 def _secret_key(folder):
@@ -37,11 +44,7 @@ def create_app(db_path=db.DB_PATH):
     )
     app.register_blueprint(api.bp)
 
-    # The chatbot team adds a "chatbot" package that exposes a Flask blueprint named bp.
-    if importlib.util.find_spec("chatbot") is not None:
-        from chatbot import bp as chatbot_bp
-
-        app.register_blueprint(chatbot_bp)
+    app.register_blueprint(chatbot.bp)
 
     @app.teardown_appcontext
     def close_db(_error):
@@ -64,7 +67,18 @@ def create_app(db_path=db.DB_PATH):
 
     @app.get("/")
     def index():
-        return "Lost and Found is running."
+        return send_from_directory(FRONTEND, "index.html")
+
+    @app.get("/<any(css, js):folder>/<path:name>")
+    def asset(folder, name):
+        return send_from_directory(FRONTEND / folder, name)
+
+    @app.after_request
+    def security_headers(response):
+        response.headers.setdefault("Content-Security-Policy", CONTENT_POLICY)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
 
     return app
 

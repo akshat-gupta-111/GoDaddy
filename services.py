@@ -1,18 +1,38 @@
 """Report logic shared by the HTTP API and the chatbot. Each call needs an open connection."""
 
+import json
+import re
 import uuid
 from collections import Counter
 from datetime import datetime
 
 import image_storage
 import matching
+import vision
 
 ITEM_FIELDS = ("item", "colour", "brand", "description")
 REQUIRED = ("report_type", "item", "colour", "brand", "place", "description")
 LIMITS = {"item": 80, "colour": 40, "brand": 60, "place": 100, "description": 1000, "text": 300}
 TIME_FORMAT = "%Y-%m-%dT%H:%M"
 MIN_SCORE = 30
-CONTACT_SCORE = 50
+# Share of the score decided by the photos when both reports have one.
+PHOTO_WEIGHT = 0.6
+# When the user's report has a photo, candidates without one are ranked lower, so that a
+# match confirmed by details and picture comes first. Their shown score is unchanged.
+NO_PHOTO_FACTOR = 0.7
+# If the item names do not match at all, the photos must be this alike.
+PHOTO_ONLY_SCORE = 80
+# Items are handed in at the Lost and Found department, so only its (mock) numbers
+# are ever shown. Reporters are never put in touch with each other.
+DEPARTMENT_CONTACTS = (
+    {"label": "Lost and Found Desk 1", "phone": "00000 00001"},
+    {"label": "Lost and Found Desk 2", "phone": "00000 00002"},
+)
+CONTACT_PATTERN = re.compile(
+    r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
+    # 10 to 15 digits with spaces, dots, brackets or hyphens, but not a date such as 2026-11-24 17:00
+    r"|(?<![\d-])(?!\d{4}-\d{2}-\d{2})\+?\(?\d(?:[ .()-]*\d){9,14}(?!\d)"
+)
 
 _SELECT = """SELECT r.report_id, r.user_id, r.report_type, r.place, r.from_time, r.to_time,
                     r.status, i.item_id, i.item, i.colour, i.brand, i.description, i.image_id
@@ -24,6 +44,11 @@ class ApiError(Exception):
         super().__init__(message)
         self.status = status
         self.fields = fields
+
+
+def redact(text):
+    """Hide emails and phone numbers typed by users."""
+    return CONTACT_PATTERN.sub("[contact removed]", text)
 
 
 def is_valid_text(value):
@@ -60,7 +85,7 @@ def clean_report(data):
         elif len(value) > LIMITS[field]:
             errors[field] = f"Must be {LIMITS[field]} characters or fewer."
             continue
-        values[field] = value
+        values[field] = value if field.endswith("_time") else redact(value)
     if values.get("from_time", "") > values.get("to_time", "9999"):
         errors["to_time"] = "Must not be earlier than from_time."
     return values, errors
@@ -83,11 +108,18 @@ def draft(data):
     }
 
 
+def department_contacts(found_something):
+    """The numbers to pop up when a searched item was found, otherwise an empty list."""
+    return [dict(c) for c in DEPARTMENT_CONTACTS] if found_something else []
+
+
 def public_report(row, user_id):
     """The shape sent to clients. Never includes the reporter's identity."""
     keys = ("report_id", "report_type", "item", "colour", "brand", "place",
             "from_time", "to_time", "description", "status")
     report = {k: row[k] for k in keys}
+    for key in ("item", "colour", "brand", "place", "description"):
+        report[key] = redact(report[key])
     try:
         report["image_url"] = image_storage.image_url(row["image_id"])
     except image_storage.StorageError:
@@ -104,7 +136,8 @@ def require_profile(conn, user_id):
         raise ApiError("Complete your profile before reporting an item.", 403)
 
 
-def create_report(conn, user_id, data):
+def create_report(conn, user_id, data, report_id=None):
+    """Save a report. Calling again with the same report_id returns the saved one."""
     require_profile(conn, user_id)
     values, errors = clean_report(data)
     for field in REQUIRED:
@@ -112,8 +145,13 @@ def create_report(conn, user_id, data):
             errors.setdefault(field, "This field is required.")
     if errors:
         raise ApiError("Check the highlighted fields.", 400, errors)
-    item_id, report_id = uuid.uuid4().hex, uuid.uuid4().hex
+    item_id, report_id = uuid.uuid4().hex, report_id or uuid.uuid4().hex
     with conn:  # both rows are saved, or neither
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute(
+            "SELECT 1 FROM reports WHERE report_id = ? AND user_id = ?", (report_id, user_id)
+        ).fetchone():
+            return public_report(get_row(conn, report_id), user_id)
         conn.execute(
             "INSERT INTO items (item_id, item, colour, brand, description) VALUES (?, ?, ?, ?, ?)",
             (item_id, *(values[f] for f in ITEM_FIELDS)),
@@ -155,6 +193,34 @@ def reunite(conn, user_id, report_id):
     return public_report(get_row(conn, report_id), user_id)
 
 
+def insights(conn):
+    """Top 3 most-lost items and top 3 hotspots, over all lost reports."""
+    rows = conn.execute(_SELECT + " WHERE r.report_type = 'lost'").fetchall()
+    items, places, labels, names = Counter(), Counter(), {}, {}
+    for row in map(dict, rows):
+        row.update(item=redact(row["item"]), place=redact(row["place"]))
+        # Group synonyms ("flask", "water bottle") but show a name someone typed.
+        item = " ".join(sorted(matching.tokens(row["item"]))) or row["item"].casefold()
+        labels.setdefault(item, row["item"])
+        items[item] += 1
+        place = row["place"].casefold()
+        names.setdefault(place, row["place"])
+        places[place] += 1
+    totals = conn.execute(
+        """SELECT COALESCE(SUM(report_type = 'found'), 0),
+                  COALESCE(SUM(status = 'reunited'), 0),
+                  COALESCE(SUM(status = 'open'), 0) FROM reports"""
+    ).fetchone()
+    return {
+        "total_found": totals[0],
+        "total_reunited": totals[1],
+        "total_open": totals[2],
+        "total_lost": len(rows),
+        "top_items": [{"item": labels[v], "count": c} for v, c in items.most_common(3)],
+        "hotspots": [{"place": names[v], "count": c} for v, c in places.most_common(3)],
+    }
+
+
 def _open_rows(conn, report_type):
     return conn.execute(
         _SELECT + " WHERE r.report_type = ? AND r.status = 'open' ORDER BY r.rowid DESC", (report_type,)
@@ -168,37 +234,73 @@ def _limit(value, default=10):
         return default
 
 
+def save_features(conn, report_id, features):
+    """Store (or with None, remove) photo features. The caller manages the transaction."""
+    if features is None:
+        conn.execute("DELETE FROM image_features WHERE report_id = ?", (report_id,))
+    else:
+        conn.execute(
+            "INSERT OR REPLACE INTO image_features (report_id, model, features) VALUES (?, ?, ?)",
+            (report_id, vision.MODEL_NAME, json.dumps(features)),
+        )
+
+
+def _all_features(conn):
+    rows = conn.execute(
+        "SELECT report_id, features FROM image_features WHERE model = ?", (vision.MODEL_NAME,)
+    )
+    return {row["report_id"]: json.loads(row["features"]) for row in rows}
+
+
+def _prefer_colour(colour, entries, row_of):
+    """Keep only entries in the wanted colour, if there are any; otherwise keep them all."""
+    wanted = matching.tokens(colour)
+    same = [e for e in entries if wanted & matching.tokens(row_of(e)["colour"])]
+    return same or entries
+
+
 def matches(conn, user_id, report_id, limit=10):
-    """Open reports of the opposite type, best first. Contact only for strong matches."""
+    """Open reports of the opposite type, best first."""
     mine = dict(own_row(conn, user_id, report_id))
     if mine["status"] != "open":
         return []
     other = "found" if mine["report_type"] == "lost" else "lost"
+    photos = _all_features(conn)
+    my_photo = photos.get(report_id)
     scored = []
     for row in _open_rows(conn, other):
+        if row["user_id"] == user_id:
+            continue  # your own report is never a match for you
         theirs = dict(row)
         lost, found = (mine, theirs) if other == "found" else (theirs, mine)
         if matching.time_conflict(lost, found):
             continue
         value = matching.score(mine, theirs)
+        rank = None
+        image_score = None
+        their_photo = photos.get(row["report_id"])
+        if my_photo and their_photo:
+            image_score = vision.similarity(my_photo, their_photo)
+            if value == 0 and image_score < PHOTO_ONLY_SCORE:
+                continue
+            value = round((1 - PHOTO_WEIGHT) * value + PHOTO_WEIGHT * image_score)
+        elif my_photo:
+            rank = value * NO_PHOTO_FACTOR
         if value >= MIN_SCORE:
-            scored.append((value, row))
-    scored.sort(key=lambda pair: pair[0], reverse=True)
+            scored.append((value if rank is None else rank, value, image_score, row))
+    scored.sort(key=lambda entry: (entry[0], entry[3]["image_id"] is not None), reverse=True)
+    scored = _prefer_colour(mine["colour"], scored, lambda entry: entry[3])
 
-    results = []
-    for value, row in scored[: _limit(limit)]:
-        contact = None
-        if value >= CONTACT_SCORE and matching.same_item(mine["item"], row["item"]):
-            person = conn.execute(
-                "SELECT user_name, phone FROM users WHERE user_id = ?", (row["user_id"],)
-            ).fetchone()
-            contact = dict(person)
-        results.append({**public_report(row, user_id), "score": value, "contact": contact})
-    return results
+    return [{**public_report(row, user_id), "score": value, "image_score": image_score}
+            for _, value, image_score, row in scored[: _limit(limit)]]
 
 
-def search(conn, user_id, filters):
-    """Drill down through open reports. Every filter is optional and affects ranking."""
+def search(conn, user_id, filters, semantic=None, include_own=True):
+    """Drill down through open reports. Every filter is optional and affects ranking.
+
+    semantic(conn, query, rows) may return {report_id: score} to match by meaning. It is used
+    only when the word rules find nothing, so it cannot push unrelated items above real hits.
+    """
     report_type = filters.get("report_type") or "found"
     if report_type not in ("lost", "found"):
         raise ApiError("report_type must be 'lost' or 'found'.")
@@ -210,20 +312,31 @@ def search(conn, user_id, filters):
         if not isinstance(value, str) or len(value) > limit or not is_valid_text(value):
             raise ApiError(f"{field} must be text of {limit} characters or fewer.")
         if value.strip():
-            query[field] = value.strip()
+            query[field] = redact(value.strip())
 
     found = []
-    for row in _open_rows(conn, report_type):
-        value = matching.score(query, dict(row)) if query else None
+    rows = _open_rows(conn, report_type)
+    if not include_own:
+        rows = [row for row in rows if row["user_id"] != user_id]
+    scores = {row["report_id"]: matching.score(query, dict(row)) for row in rows} if query else {}
+    if semantic and query and not any(v >= MIN_SCORE for v in scores.values()):
+        scores = semantic(conn, query, rows) or scores
+    for row in rows:
+        value = scores.get(row["report_id"], 0) if query else None
         if value is None or value >= MIN_SCORE:
             found.append((value, row))
+    if "colour" in query:
+        found = _prefer_colour(query["colour"], found, lambda pair: pair[1])
     if query:
-        found.sort(key=lambda pair: pair[0], reverse=True)
+        # On equal scores, show reports that have a photo first.
+        found.sort(key=lambda pair: (pair[0], pair[1]["image_id"] is not None), reverse=True)
 
     facets = {}
     for field in ("item", "colour", "brand", "place"):
-        counts = Counter(row[field].casefold() for _, row in found)
+        counts = Counter(redact(row[field]).casefold() for _, row in found)
         facets[field] = [{"value": v, "count": c} for v, c in counts.most_common(8)]
     results = [{**public_report(row, user_id), "score": value}
                for value, row in found[: _limit(filters.get("limit"), 5)]]
-    return {"total": len(found), "results": results, "facets": facets}
+    # Browsing without any search words is not "finding" something.
+    contacts = department_contacts(bool(query and results))
+    return {"total": len(found), "results": results, "facets": facets, "contacts": contacts}

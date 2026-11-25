@@ -64,11 +64,6 @@ def score(query, candidate):
     return round(100 * sum(w * s for w, s in parts.values()) / total)
 
 
-def same_item(a, b):
-    """True only when both name a known item and the names overlap."""
-    return _known(a) and _known(b) and _similarity(a, b) > 0
-
-
 def time_conflict(lost, found):
     """True when the item was found before it could have been lost."""
     start, seen = lost.get("from_time"), found.get("from_time")

@@ -1,121 +1,67 @@
-/**
- * BLUE.App — Application router, navbar active states, modals & bootstrap
- */
-(function (global) {
-  const BLUE = (global.BLUE = global.BLUE || {});
+/* Routing and session. */
+(function (BLUE) {
+  const view = document.getElementById("view");
+  const nav = document.getElementById("nav");
+  const ROUTES = ["assistant", "lost", "found", "mine", "dashboard", "profile"];
+  BLUE.user = null;
 
-  const ROUTES = ["auth", "profile", "lost", "found", "dashboard"];
-
-  function navigate(route, updateHash = true) {
-    const targetRoute = ROUTES.includes(route) ? route : "auth";
-
-    ROUTES.forEach((r) => {
-      const pageEl = document.getElementById(`page-${r}`);
-      const navEl = document.getElementById(`nav-${r}`);
-      const active = r === targetRoute;
-      if (pageEl) pageEl.hidden = !active;
-      if (navEl) navEl.classList.toggle("active", active);
+  function render() {
+    BLUE.closeDialog();
+    nav.hidden = !BLUE.user;
+    let route = location.hash.slice(1);
+    if (!BLUE.user) {
+      view.replaceChildren(BLUE.pages.auth());
+      return;
+    }
+    if (!ROUTES.includes(route)) route = "assistant";
+    // Reporting needs a complete profile, so send new users there first.
+    if (!BLUE.user.profile_complete) route = "profile";
+    nav.querySelectorAll("a").forEach((a) => {
+      if (a.hash === `#${route}`) a.setAttribute("aria-current", "page");
+      else a.removeAttribute("aria-current");
     });
-
-    if (targetRoute === "profile") {
-      BLUE.Profile.render();
-    } else if (targetRoute === "dashboard") {
-      BLUE.Dashboard.render();
-    }
-
-    if (updateHash && global.location.hash !== `#${targetRoute}`) {
-      global.location.hash = `#${targetRoute}`;
-    }
-
-    const navMenu = document.getElementById("nav-menu");
-    const navToggle = document.getElementById("nav-toggle");
-    if (navMenu && navMenu.classList.contains("open")) {
-      navMenu.classList.remove("open");
-      navToggle.setAttribute("aria-expanded", "false");
-    }
+    const page = route === "assistant" ? BLUE.chat.page()
+      : route === "profile" ? BLUE.pages.profile(BLUE.user) : BLUE.pages[route]();
+    view.replaceChildren(page);
+    window.scrollTo(0, 0);
   }
 
-  function onAuthChanged() {
-    const user = BLUE.Api.getCurrentUser();
-    const pill = document.getElementById("nav-session-pill");
-    const usernameEl = document.getElementById("nav-session-username");
-    if (user) {
-      pill.hidden = false;
-      usernameEl.textContent = `@${user.username}`;
-    } else {
-      pill.hidden = true;
-    }
-  }
+  BLUE.go = (route) => { if (location.hash === `#${route}`) render(); else location.hash = `#${route}`; };
 
-  function setupModals() {
-    document.querySelectorAll("[data-close-modal]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const modal = document.getElementById(btn.dataset.closeModal);
-        if (modal) modal.hidden = true;
-      });
-    });
-
-    document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
-      backdrop.addEventListener("click", (e) => {
-        if (e.target === backdrop) backdrop.hidden = true;
-      });
-    });
-
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") {
-        document.querySelectorAll(".modal-backdrop").forEach((m) => {
-          m.hidden = true;
-        });
-      }
-    });
-  }
-
-  function init() {
-    BLUE.Storage.ensureSeeded();
-    setupModals();
-
-    BLUE.Auth.init();
-    BLUE.Profile.init();
-    BLUE.ChatWindow.init();
-    BLUE.Items.init();
-    BLUE.Dashboard.init();
-
-    document.querySelectorAll("[data-route]").forEach((el) => {
-      el.addEventListener("click", (e) => {
-        e.preventDefault();
-        navigate(el.dataset.route);
-      });
-    });
-
-    const navToggle = document.getElementById("nav-toggle");
-    const navMenu = document.getElementById("nav-menu");
-    navToggle.addEventListener("click", () => {
-      const nextOpen = !navMenu.classList.contains("open");
-      navMenu.classList.toggle("open", nextOpen);
-      navToggle.setAttribute("aria-expanded", String(nextOpen));
-    });
-
-    global.addEventListener("hashchange", () => {
-      const hashRoute = global.location.hash.replace("#", "");
-      navigate(hashRoute || "auth", false);
-    });
-
-    onAuthChanged();
-
-    const initialHash = global.location.hash.replace("#", "");
-    if (ROUTES.includes(initialHash)) {
-      navigate(initialHash, false);
-    } else {
-      const user = BLUE.Api.getCurrentUser();
-      navigate(user ? "profile" : "auth");
-    }
-  }
-
-  BLUE.App = {
-    init,
-    navigate,
-    onAuthChanged,
+  BLUE.signedIn = ({ token, user }) => {
+    BLUE.token.set(token);
+    BLUE.user = user;
+    BLUE.chat.reset();
+    BLUE.go("assistant");
   };
 
-  document.addEventListener("DOMContentLoaded", init);
-})(window);
+  BLUE.onSignedOut = (message = "Please log in again.") => {
+    BLUE.token.set("");
+    BLUE.user = null;
+    BLUE.chat.reset();
+    history.replaceState(null, "", location.pathname);
+    render();
+    BLUE.toast(message);
+  };
+
+  async function start() {
+    document.querySelector(".dialog-close").addEventListener("click", BLUE.closeDialog);
+    window.addEventListener("hashchange", render);
+    // Another tab logged in or out: reload so old forms and chats are not sent as someone else.
+    window.addEventListener("storage", (e) => { if (e.key === "blue_token" || e.key === null) location.reload(); });
+    if (BLUE.token.get()) {
+      try {
+        BLUE.user = (await BLUE.api.profile()).user;
+      } catch (error) {
+        if (error.status !== 401) {
+          view.replaceChildren(BLUE.h("p", { class: "empty" }, error.message, " ",
+            BLUE.h("button", { type: "button", class: "btn", onclick: () => location.reload() }, "Retry")));
+          return;
+        }
+      }
+    }
+    render();
+  }
+
+  start();
+})(window.BLUE = window.BLUE || {});

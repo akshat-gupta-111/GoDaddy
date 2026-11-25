@@ -66,27 +66,31 @@ class ApiTest(unittest.TestCase):
         self.report("found", self.finder, item="water bottle")
         self.report("found", self.finder, item="charger", colour="white", description="usb charger")
         url = f"/api/reports/{lost['report_id']}"
-        matches = self.client.get(url + "/matches", headers=self.owner).get_json()["matches"]
+        data = self.client.get(url + "/matches", headers=self.owner).get_json()
+        matches = data["matches"]
+        self.assertEqual([c["phone"] for c in data["contacts"]], ["00000 00001", "00000 00002"])
         self.assertEqual([m["item"] for m in matches], ["water bottle"])
         self.assertGreaterEqual(matches[0]["score"], 70)
-        self.assertEqual(matches[0]["contact"]["phone"], "0000000000")
+        self.assertNotIn("contact", matches[0])
         self.assertNotIn("user_id", matches[0])
         self.assertEqual(self.client.get(url + "/matches", headers=self.finder).status_code, 403)
         self.assertEqual(self.client.post(url + "/reunite", headers=self.finder).status_code, 403)
         done = self.client.post(url + "/reunite", headers=self.owner)
         self.assertEqual(done.get_json()["report"]["status"], "reunited")
 
-    def test_no_contact_for_place_only_or_impossible_match(self):
+    def test_never_shares_a_reporter_and_skips_impossible_match(self):
         vague = dict(item="unknown", colour="unknown", description="unknown")
         lost = self.report("lost", self.owner, **vague).get_json()["report"]
         self.report("found", self.finder, item="umbrella", colour="red", description="red umbrella")
         url = f"/api/reports/{lost['report_id']}/matches"
-        for match in self.client.get(url, headers=self.owner).get_json()["matches"]:
-            self.assertIsNone(match["contact"])
+        body = self.client.get(url, headers=self.owner).get_data(as_text=True)
+        for private in ("Test R2", "0000000000"):
+            self.assertNotIn(private, body)
         lost = self.report("lost", self.owner, from_time="2026-11-25T12:00").get_json()["report"]
         self.report("found", self.finder, from_time="2026-11-24T12:00")
         url = f"/api/reports/{lost['report_id']}/matches"
-        self.assertEqual(self.client.get(url, headers=self.owner).get_json()["matches"], [])
+        data = self.client.get(url, headers=self.owner).get_json()
+        self.assertEqual((data["matches"], data["contacts"]), ([], []))
 
     def test_bad_text_and_ids(self):
         bad = "\ud800password"
@@ -106,9 +110,11 @@ class ApiTest(unittest.TestCase):
         self.assertEqual({f["value"] for f in broad["facets"]["colour"]}, {"gray", "black"})
         narrow = search(item="hoodie", colour="grey", place="library")
         self.assertEqual(narrow["results"][0]["colour"], "gray")
-        self.assertNotIn("contact", narrow["results"][0])
+        self.assertEqual(len(narrow["contacts"]), 2)
+        self.assertEqual(search(item="umbrella")["contacts"], [])
         self.assertEqual(search(item="umbrella")["total"], 0)
         self.assertEqual(search()["total"], 2)
+        self.assertEqual(search()["contacts"], [])
 
     def test_draft(self):
         post = lambda **d: self.client.post("/api/chat/draft", headers=self.owner, json=d).get_json()

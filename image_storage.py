@@ -9,7 +9,8 @@ from urllib.parse import urlsplit
 from dotenv import load_dotenv
 
 # Must run before importing cloudinary, which reads CLOUDINARY_URL on import.
-load_dotenv(Path(__file__).resolve().parent / ".env")
+# override=True: this project's .env wins over variables already set in the shell.
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 import cloudinary  # noqa: E402
 import cloudinary.exceptions  # noqa: E402
@@ -105,7 +106,11 @@ def image_url(image_id):
     if not image_id:
         return None
     _require_config()
-    url, _ = cloudinary.utils.cloudinary_url(image_id, secure=True)
+    options = {}
+    if image_id.startswith(f"{FOLDER}/demo-"):
+        # The mock photos sit in a wide white border; show just the middle.
+        options["transformation"] = [{"crop": "crop", "gravity": "center", "width": "0.5", "height": "0.36"}]
+    url, _ = cloudinary.utils.cloudinary_url(image_id, secure=True, **options)
     return url
 
 

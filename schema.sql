@@ -37,3 +37,23 @@ CREATE TABLE IF NOT EXISTS reports (
 
 CREATE INDEX IF NOT EXISTS idx_reports_user ON reports (user_id);
 CREATE INDEX IF NOT EXISTS idx_reports_type_status ON reports (report_type, status);
+
+-- Tokens that were logged out before they expired.
+CREATE TABLE IF NOT EXISTS revoked_tokens (
+    token_id   TEXT NOT NULL PRIMARY KEY,
+    expires_at INTEGER NOT NULL
+);
+
+-- Cached search vectors for the chatbot.
+CREATE TABLE IF NOT EXISTS embeddings (
+    report_id TEXT NOT NULL PRIMARY KEY REFERENCES reports (report_id) ON DELETE CASCADE,
+    model     TEXT NOT NULL,
+    vector    TEXT NOT NULL
+);
+
+-- CNN features of each report's photo, used for image matching.
+CREATE TABLE IF NOT EXISTS image_features (
+    report_id TEXT NOT NULL PRIMARY KEY REFERENCES reports (report_id) ON DELETE CASCADE,
+    model     TEXT NOT NULL,
+    features  TEXT NOT NULL
+);

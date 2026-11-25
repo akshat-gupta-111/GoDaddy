@@ -1,7 +1,9 @@
 """HTTP routes. All paths start with /api and exchange JSON."""
 
+import io
 import re
 import sqlite3
+import time
 import uuid
 from functools import wraps
 
@@ -12,6 +14,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import db
 import image_storage
 import services
+import vision
 from services import ApiError
 
 bp = Blueprint("api", __name__, url_prefix="/api")
@@ -40,12 +43,18 @@ def login_required(view):
         try:
             if scheme.lower() != "bearer":
                 raise BadData("missing token")
-            user_id = _serializer().loads(token, max_age=TOKEN_SECONDS)
-        except BadData:
+            claims = _serializer().loads(token, max_age=TOKEN_SECONDS)
+            user_id, token_id = claims["u"], claims["j"]
+        except (BadData, KeyError, TypeError, UnicodeError):
             raise ApiError("Please log in.", 401)
-        if not get_db().execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone():
+        row = get_db().execute(
+            """SELECT 1 FROM users WHERE user_id = ?
+               AND NOT EXISTS (SELECT 1 FROM revoked_tokens WHERE token_id = ?)""",
+            (user_id, token_id),
+        ).fetchone()
+        if not row:
             raise ApiError("Please log in.", 401)
-        g.user_id = user_id
+        g.user_id, g.token_id = user_id, token_id
         return view(*args, **kwargs)
 
     return wrapped
@@ -71,7 +80,8 @@ def _user(user_id):
 
 
 def _session(user_id, status=200):
-    return jsonify(token=_serializer().dumps(user_id), user=_user(user_id)), status
+    token = _serializer().dumps({"u": user_id, "j": uuid.uuid4().hex})
+    return jsonify(token=token, user=_user(user_id)), status
 
 
 def _credentials():
@@ -114,6 +124,20 @@ def login():
     if row is None or len(password) > 128 or not check_password_hash(row["password_hash"], password):
         raise ApiError("Wrong email or password.", 401)
     return _session(row["user_id"])
+
+
+@bp.post("/logout")
+@login_required
+def logout():
+    """Invalidate this token only; other devices stay logged in."""
+    now = int(time.time())
+    with get_db() as conn:
+        conn.execute("DELETE FROM revoked_tokens WHERE expires_at < ?", (now,))
+        conn.execute(
+            "INSERT OR IGNORE INTO revoked_tokens (token_id, expires_at) VALUES (?, ?)",
+            (g.token_id, now + TOKEN_SECONDS),
+        )
+    return jsonify(ok=True)
 
 
 @bp.get("/profile")
@@ -186,7 +210,7 @@ def one_report(report_id):
 @login_required
 def report_matches(report_id):
     found = services.matches(get_db(), g.user_id, report_id, request.args.get("limit", 10))
-    return jsonify(matches=found)
+    return jsonify(matches=found, contacts=services.department_contacts(bool(found)))
 
 
 @bp.post("/reports/<report_id>/reunite")
@@ -197,45 +221,67 @@ def report_reunite(report_id):
 
 def _discard(image_id):
     """Best-effort cleanup; a failure leaves an unused file on Cloudinary."""
-    if image_id:
+    # Demo photos have fixed ids that other copies of the database may also use.
+    if image_id and not image_id.startswith(f"{image_storage.FOLDER}/demo-"):
         try:
             image_storage.delete_image(image_id)
         except image_storage.StorageError:
             current_app.logger.warning("Could not delete image %s", image_id)
 
 
-@bp.post("/reports/<report_id>/image")
-@login_required
-def report_image(report_id):
+def attach_image(report_id):
+    """Upload the "image" form file to the user's report and index it for matching."""
     conn = get_db()
     row = services.own_row(conn, g.user_id, report_id)
     file = request.files.get("image")
     if file is None:
         raise ApiError("Send the photo as multipart form field 'image'.")
+    data = file.stream.read(image_storage.MAX_BYTES + 1)
     try:
-        image_id = image_storage.upload_image(file.stream)
+        image_id = image_storage.upload_image(io.BytesIO(data))
     except image_storage.InvalidImage as error:
         raise ApiError(str(error))
     except image_storage.StorageError as error:
         _discard(error.image_id)
         raise ApiError("Image upload failed. Try again.", 502)
     try:
+        features = vision.features(data)
+    except vision.VisionError as error:
+        # The photo is still saved; matching falls back to text for this report.
+        current_app.logger.warning("%s", error)
+        features = None
+    try:
         with conn:
             # Re-read under a write lock so two uploads cannot both replace the same old image.
             conn.execute("BEGIN IMMEDIATE")
             old = services.get_row(conn, report_id)["image_id"]
             conn.execute("UPDATE items SET image_id = ? WHERE item_id = ?", (image_id, row["item_id"]))
+            services.save_features(conn, report_id, features)
     except Exception:
         _discard(image_id)
         raise
     _discard(old)
-    return jsonify(report=services.public_report(services.get_row(conn, report_id), g.user_id))
+    report = services.public_report(services.get_row(conn, report_id), g.user_id)
+    return report, features is not None
+
+
+@bp.post("/reports/<report_id>/image")
+@login_required
+def report_image(report_id):
+    report, analysed = attach_image(report_id)
+    return jsonify(report=report, image_analysed=analysed)
 
 
 @bp.post("/search")
 @login_required
 def search():
     return jsonify(services.search(get_db(), g.user_id, body()))
+
+
+@bp.get("/insights")
+@login_required
+def insights():
+    return jsonify(services.insights(get_db()))
 
 
 @bp.post("/chat/draft")

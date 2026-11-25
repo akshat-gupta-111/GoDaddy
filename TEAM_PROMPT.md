@@ -125,8 +125,27 @@ def chat():
     ...
 ```
 
-Use Azure OpenAI GPT-4o (`openai` package, `AzureOpenAI` client, settings from the `AZURE_OPENAI_*`
-variables in `.env`) with tool calling. Call these functions directly instead of calling HTTP:
+Use Azure OpenAI GPT-4o with tool calling. `AZURE_OPENAI_ENDPOINT` is the full chat completions URL
+(deployment and API version included): POST to it with the header `api-key: <AZURE_OPENAI_API_KEY>` and
+a JSON body containing `messages`, `tools` and `tool_choice`; read `choices[0].message`. If you prefer
+the `openai` package, split the URL first and do not pass it whole as `azure_endpoint`:
+
+```python
+import os
+from urllib.parse import parse_qs, urlsplit
+from openai import AzureOpenAI
+
+url = urlsplit(os.environ["AZURE_OPENAI_ENDPOINT"])
+deployment = url.path.split("/deployments/")[1].split("/")[0]  # pass as model=deployment
+client = AzureOpenAI(
+    azure_endpoint=f"{url.scheme}://{url.netloc}",
+    api_version=parse_qs(url.query)["api-version"][0],
+    api_key=os.environ["AZURE_OPENAI_API_KEY"],
+    timeout=30,
+)
+```
+
+`app.py` already loads `.env`. Call these backend functions directly instead of calling HTTP:
 
 | Tool | Function |
 |---|---|
@@ -158,5 +177,12 @@ Guardrails:
 - Before `save_report`, check in code (not only in the prompt) that the user confirmed that exact draft.
 - If Azure fails, return a 502 with `{"error": "..."}`.
 
-Embeddings are optional, after both conversations work. Use them to re-rank search results; store
-vectors in your own SQLite table created by your package, keyed by `report_id`.
+Embeddings are optional, after both conversations work. `AZURE_OPENAI_EMBEDDINGS_ENDPOINT` is the full
+request URL (deployment and API version included): send a POST to it with the header
+`api-key: <AZURE_OPENAI_EMBEDDINGS_API_KEY>` and the JSON body `{"input": ["text", ...]}`, and read
+`data[i].embedding`. Do not pass this URL as `azure_endpoint` to the chat client. Set a timeout and
+fall back to the normal search results if the call fails. Use them to re-rank search results; store
+vectors in your own SQLite table created by your package, keyed by `report_id`. With each vector, save the full
+embeddings endpoint URL plus a model version constant from your code (change it if the model is upgraded
+behind the same URL). Compare only vectors where both match; until they are regenerated, keep the
+normal search order.
